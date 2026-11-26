@@ -97,7 +97,7 @@ find_index() {
   return 1
 }
 
-refresh || { echo "sound: cannot read the list of outputs" >&2; exit 1; }
+refresh || { echo "sound: cannot read the list of outputs (pactl >= 16 with JSON output is required)" >&2; exit 1; }
 (( ${#NAMES[@]} )) || { echo "sound: no audio outputs found" >&2; exit 1; }
 
 case "${1:-}" in
