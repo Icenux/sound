@@ -20,7 +20,7 @@ depends:
   - bash
   - jq
   - ncurses-bin
-  - pulseaudio-utils (>= 1:16.0)
+  - pulseaudio-utils
 
 overrides:
   archlinux:
