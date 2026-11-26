@@ -1,0 +1,65 @@
+name: CI
+# Syntax check, ShellCheck and a trial build of both packages on every PR and push to main.
+# nfpm is pinned (version + SHA256) like in release.yml: bump both files together.
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+env:
+  NFPM_VERSION: "2.49.0"
+  NFPM_SHA256: "2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Syntax (bash -n)
+        run: bash -n sound packaging/package.sh packaging/files/postinst.sh
+      - name: ShellCheck
+        run: shellcheck sound packaging/package.sh packaging/files/postinst.sh
+      - name: --version
+        run: |
+          out=$(./sound --version)
+          echo "$out"
+          built=$(sed -n 's/^VERSION="\(.*\)"/\1/p' sound | head -1)
+          test "$out" = "sound $built"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: nfpm
+        run: |
+          curl -fsSL -o /tmp/nfpm.tgz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  /tmp/nfpm.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/nfpm.tgz -C /usr/local/bin nfpm
+      - name: Build both packages
+        run: bash packaging/package.sh "$(sed -n 's/^VERSION="\(.*\)"/\1/p' sound | head -1)"
+      - name: The packages contain the program and the right dependencies
+        run: |
+          cd dist/release
+          # Capture each listing first: `tar -t | grep -q` under pipefail fails with SIGPIPE when grep exits early.
+          deb_files=$(dpkg-deb -c sound_all.deb)
+          deb_depends=$(dpkg-deb -f sound_all.deb Depends)
+          arch_files=$(tar --zstd -tf sound-*.pkg.tar.zst)
+          pkginfo=$(tar --zstd -xOf sound-*.pkg.tar.zst .PKGINFO)
+          grep -q ' ./usr/bin/sound$' <<< "$deb_files"
+          grep -q 'jq' <<< "$deb_depends"
+          grep -q 'pulseaudio-utils' <<< "$deb_depends"
+          grep -q '^usr/bin/sound$' <<< "$arch_files"
+          grep -q '^depend = jq$' <<< "$pkginfo"
+          grep -q '^depend = libpulse$' <<< "$pkginfo"

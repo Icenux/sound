@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# sound - TUI for switching the default audio output (PipeWire / PulseAudio)
+#
+#   Up/Down, j/k  select an output
+#   1-9           switch to output N immediately
+#   Enter         switch to the selected output
+#   m             mute / unmute the selected output
+#   r             reload the list of outputs
+#   q / Esc       quit
+#
+# Non-interactive:
+#   sound list                      list outputs ("*" marks the default)
+#   sound next                      switch to the next output (wraps around)
+#   sound set <N|name|description>  switch by number, sink name or part of
+#                                   the description (case-insensitive)
+#   sound --version                 print the version
+#
+# The list of outputs is re-read on every start, on every keypress and
+# every 2 s, so newly connected devices (HDMI monitor, Bluetooth, USB)
+# show up on their own. Switching also moves streams that are already
+# playing and unmutes the new output.
+#
+# Requirements: bash >= 4.0, pactl >= 16 (JSON output; part of
+# pulseaudio-utils / libpulse, works with PipeWire via pipewire-pulse),
+# jq, tput (ncurses). Not tied to any desktop environment or compositor.
+
+set -uo pipefail
+
+VERSION="0.0.1"
+case "${1:-}" in
+  --version|-V) echo "sound $VERSION"; exit 0 ;;
+esac
+
+for c in pactl jq; do
+  command -v "$c" >/dev/null || { echo "sound: '$c' is required but not installed" >&2; exit 1; }
+done
+pactl info >/dev/null 2>&1 || { echo "sound: no PipeWire/PulseAudio server is running" >&2; exit 1; }
+
+# Arrays filled by refresh()
+NAMES=(); DESCS=(); PORTS=(); STATES=(); MUTES=(); VOLS=(); DEFAULT=""
+
+refresh() {
+  NAMES=(); DESCS=(); PORTS=(); STATES=(); MUTES=(); VOLS=()
+  DEFAULT=$(pactl get-default-sink 2>/dev/null)
+  local json n d p a m v
+  json=$(pactl -f json list sinks 2>/dev/null) || return 1
+  # name <TAB> description <TAB> active port <TAB> availability <TAB> mute <TAB> volume %
+  while IFS=$'\t' read -r n d p a m v; do
+    NAMES+=("$n"); DESCS+=("$d"); PORTS+=("$p"); STATES+=("$a"); MUTES+=("$m"); VOLS+=("$v")
+  done < <(jq -r '.[] |
+      . as $s
+      | ($s.ports // [] | map(select(.name == $s.active_port)) | .[0]) as $ap
+      | [ $s.name,
+          $s.description,
+          ($ap.description // "-"),
+          ($ap.availability // "unknown"),
+          (if $s.mute then "yes" else "no" end),
+          (($s.volume | to_entries | .[0].value.value_percent) // "?") ]
+      | @tsv' <<<"$json")
+}
+
+# Move already playing streams to the new output
+move_streams() {
+  local sink=$1 id
+  while read -r id _; do
+    [[ -n $id ]] && pactl move-sink-input "$id" "$sink" 2>/dev/null
+  done < <(pactl list short sink-inputs 2>/dev/null)
+}
+
+apply() {
+  local i=$1 name=${NAMES[$1]}
+  pactl set-default-sink "$name" || return 1
+  move_streams "$name"
+  # Unmute the new output - otherwise "switched" would just mean silence
+  [[ ${MUTES[$i]} == yes ]] && pactl set-sink-mute "$name" 0
+  refresh
+}
+
+# --- non-interactive modes ----------------------------------------------------
+print_list() {
+  local i mark
+  for i in "${!NAMES[@]}"; do
+    mark=" "; [[ ${NAMES[$i]} == "$DEFAULT" ]] && mark="*"
+    printf '%s %d  %s | %s | %s | %s\n' "$mark" "$((i+1))" "${DESCS[$i]}" "${PORTS[$i]}" "${STATES[$i]}" "${VOLS[$i]}"
+  done
+}
+
+find_index() {
+  local q=$1 i
+  if [[ $q =~ ^[0-9]+$ ]] && (( q >= 1 && q <= ${#NAMES[@]} )); then echo $((q-1)); return 0; fi
+  for i in "${!NAMES[@]}"; do [[ ${NAMES[$i]} == "$q" ]] && { echo "$i"; return 0; }; done
+  for i in "${!DESCS[@]}"; do
+    shopt -s nocasematch
+    if [[ ${DESCS[$i]} == *"$q"* ]]; then shopt -u nocasematch; echo "$i"; return 0; fi
+    shopt -u nocasematch
+  done
+  return 1
+}
+
+refresh || { echo "sound: cannot read the list of outputs" >&2; exit 1; }
+(( ${#NAMES[@]} )) || { echo "sound: no audio outputs found" >&2; exit 1; }
+
+case "${1:-}" in
+  list|-l) print_list; exit 0 ;;
+  next)
+    cur=0
+    for i in "${!NAMES[@]}"; do [[ ${NAMES[$i]} == "$DEFAULT" ]] && cur=$i; done
+    nxt=$(( (cur + 1) % ${#NAMES[@]} ))
+    apply "$nxt" && echo "-> ${DESCS[$nxt]}"
+    exit $? ;;
+  set)
+    [[ -n ${2:-} ]] || { echo "usage: sound set <N|name|description>" >&2; exit 1; }
+    idx=$(find_index "$2") || { echo "sound: output '$2' not found" >&2; print_list >&2; exit 1; }
+    apply "$idx" && echo "-> ${DESCS[$idx]}"
+    exit $? ;;
+  -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "sound: unknown command '$1' (see sound --help)" >&2; exit 1 ;;
+esac
+
+# --- TUI ------------------------------------------------------------------------
+[[ -t 0 && -t 1 ]] || { print_list; exit 0; }
+
+sel=0
+MSG=""
+cleanup() { tput cnorm 2>/dev/null; tput rmcup 2>/dev/null; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+tput smcup 2>/dev/null; tput civis 2>/dev/null
+
+select_default() {
+  local i
+  for i in "${!NAMES[@]}"; do [[ ${NAMES[$i]} == "$DEFAULT" ]] && { sel=$i; return; }; done
+}
+select_default
+
+draw() {
+  local i mark line cols dw=0 pw=0
+  cols=$(tput cols 2>/dev/null || echo 80)
+  # Column widths follow the longest description / port, capped to the terminal width
+  for i in "${!NAMES[@]}"; do
+    (( ${#DESCS[$i]} > dw )) && dw=${#DESCS[$i]}
+    (( ${#PORTS[$i]} > pw )) && pw=${#PORTS[$i]}
+  done
+  (( pw > 20 )) && pw=20
+  (( dw > cols - pw - 14 )) && dw=$(( cols - pw - 14 ))
+  (( dw < 10 )) && dw=10
+  printf '\033[H\033[2J'
+  printf '\033[1msound\033[0m - audio outputs\n\n'
+  for i in "${!NAMES[@]}"; do
+    mark="  "; [[ ${NAMES[$i]} == "$DEFAULT" ]] && mark="● "
+    line=$(printf '%s%d  %-*s  %-*s  %4s' "$mark" "$((i+1))" "$dw" "${DESCS[$i]:0:dw}" "$pw" "${PORTS[$i]:0:pw}" "${VOLS[$i]}")
+    [[ ${MUTES[$i]} == yes ]] && line+="  [muted]"
+    [[ ${STATES[$i]} == "not available" ]] && line+="  [unplugged]"
+    if (( i == sel )); then printf '\033[7m%s\033[0m\n' "$line"; else printf '%s\n' "$line"; fi
+  done
+  printf '\n\033[2mUp/Down or j/k select · 1-9 switch · Enter switch · m mute · r reload · q quit\033[0m\n'
+  [[ -n $MSG ]] && printf '\n%s\n' "$MSG"
+}
+
+draw
+while true; do
+  key=""
+  if IFS= read -rsn1 -t 2 key; then
+    if [[ $key == $'\033' ]]; then
+      rest=""; IFS= read -rsn2 -t 0.05 rest
+      case "$rest" in
+        '[A') key=up ;; '[B') key=down ;; *) key=q ;;
+      esac
+    fi
+    MSG=""
+    case "$key" in
+      up|k)   refresh; (( sel > 0 )) && sel=$((sel-1)) ;;
+      down|j) refresh; (( sel < ${#NAMES[@]}-1 )) && sel=$((sel+1)) ;;
+      '')     refresh; apply "$sel" && MSG="Switched to: ${DESCS[$sel]}" ;;
+      [1-9])  refresh
+              if (( key <= ${#NAMES[@]} )); then
+                sel=$((key-1)); apply "$sel" && MSG="Switched to: ${DESCS[$sel]}"
+              fi ;;
+      m)      refresh; pactl set-sink-mute "${NAMES[$sel]}" toggle; refresh ;;
+      r)      refresh; MSG="Reloaded" ;;
+      q|Q)    exit 0 ;;
+    esac
+  else
+    # timeout - silent refresh (keeps the selection by sink name)
+    cur=${NAMES[$sel]:-}
+    refresh
+    for i in "${!NAMES[@]}"; do [[ ${NAMES[$i]} == "$cur" ]] && sel=$i; done
+  fi
+  (( sel >= ${#NAMES[@]} )) && sel=$(( ${#NAMES[@]} > 0 ? ${#NAMES[@]}-1 : 0 ))
+  draw
+done
